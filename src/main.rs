@@ -70,33 +70,46 @@ fn do_ownership_switch<'a>(_signal: (), conn: &Connection, msg: &Message) -> boo
 
 fn perform_chown_to_uid(uid: Uid) {
     let path = FsPathBuf::from("/opt/steamlib/");
+    let meta = path.symlink_metadata().unwrap();
     // safe because we just matched the user to be in this group
     let group = Group::from_name("users")
-        .expect("Group db was queried for getgrouplist")
-        .expect("user was in users")
+        .expect("group lookup")
+        .expect("users group exists")
         .gid;
 
-    recursive_chown(path, uid.as_raw(), group.as_raw());
+    recursive_chown(path, meta.dev(), uid.as_raw(), group.as_raw());
 }
 
-fn recursive_chown_this_level(path: &FsPathBuf, uid: u32, gid: u32) -> Result<(), std::io::Error> {
+fn recursive_chown_fallible(
+    path: &FsPathBuf,
+    dev: u64,
+    uid: u32,
+    gid: u32,
+) -> Result<(), std::io::Error> {
     let path_metadata = symlink_metadata(path)?;
     if !path_metadata.is_symlink() {
-        if path_metadata.uid() != uid || path_metadata.gid() != gid {
-            lchown(path, Some(uid), Some(gid))?;
-        }
-        if path_metadata.is_dir() {
-            for child in read_dir(path)? {
-                let child = child?;
-                recursive_chown(child.path(), uid, gid);
+        let this_device = path_metadata.dev();
+        if this_device != dev {
+            eprintln!(
+                "Crossing device boundary from {dev} to {this_device}, dubious, we're not doing this"
+            )
+        } else {
+            if path_metadata.uid() != uid || path_metadata.gid() != gid {
+                lchown(path, Some(uid), Some(gid))?;
+            }
+            if path_metadata.is_dir() {
+                for child in read_dir(path)? {
+                    let child = child?;
+                    recursive_chown(child.path(), dev, uid, gid);
+                }
             }
         }
     }
     Ok(())
 }
 
-fn recursive_chown(path: FsPathBuf, uid: u32, gid: u32) {
-    if let Some(error) = recursive_chown_this_level(&path, uid, gid).err() {
+fn recursive_chown(path: FsPathBuf, dev: u64, uid: u32, gid: u32) {
+    if let Some(error) = recursive_chown_fallible(&path, dev, uid, gid).err() {
         eprintln!("Could not chown and recurse at {path:?}: {error}")
     }
 }
