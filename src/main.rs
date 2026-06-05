@@ -61,15 +61,15 @@ fn do_ownership_switch<'a>(_signal: (), conn: &Connection, msg: &Message) -> boo
             let uid_to_switch = Uid::from_raw(uid_to_switch);
             if session_owner_is_in_users_group(uid_to_switch) {
                 println!("Switching to {uid_to_switch}");
-                perform_chown_to_uid(uid_to_switch);
-                println!("Switch complete");
+                let count = perform_chown_to_uid(uid_to_switch);
+                println!("Switch complete, altered {count} files");
             }
         }
     }
     true
 }
 
-fn perform_chown_to_uid(uid: Uid) {
+fn perform_chown_to_uid(uid: Uid) -> u64 {
     let path = PathBuf::from("/opt/steamlib/");
     let meta = path.symlink_metadata().unwrap();
     // safe because we just matched the user to be in this group
@@ -78,12 +78,13 @@ fn perform_chown_to_uid(uid: Uid) {
         .expect("users group exists")
         .gid;
 
-    walk_and_chown(path, meta.dev(), uid.as_raw(), group.as_raw());
+    walk_and_chown(path, meta.dev(), uid.as_raw(), group.as_raw())
 }
 
 fn chown_and_queue_children(
     path: &PathBuf,
     queue: &mut VecDeque<PathBuf>,
+    count: &mut u64,
     dev: u64,
     uid: u32,
     gid: u32,
@@ -98,6 +99,7 @@ fn chown_and_queue_children(
         } else {
             if path_metadata.uid() != uid || path_metadata.gid() != gid {
                 lchown(path, Some(uid), Some(gid))?;
+                *count += 1;
             }
             if path_metadata.is_dir() {
                 for child in read_dir(path)? {
@@ -110,16 +112,19 @@ fn chown_and_queue_children(
     Ok(())
 }
 
-fn walk_and_chown(path: PathBuf, dev: u64, uid: u32, gid: u32) {
+fn walk_and_chown(path: PathBuf, dev: u64, uid: u32, gid: u32) -> u64 {
     let mut queue = VecDeque::new();
+    let mut count = 0;
     queue.push_back(path);
 
     while let Some(path) = queue.pop_front() {
-        let error = chown_and_queue_children(&path, &mut queue, dev, uid, gid).err();
+        let error = chown_and_queue_children(&path, &mut queue, &mut count, dev, uid, gid).err();
         if let Some(error) = error {
             eprintln!("Could not introspect and chown at {path:?}: {error}")
         }
     }
+
+    count
 }
 
 fn get_group_list_for_user(uid: Uid) -> nix::Result<Vec<Group>> {
@@ -127,7 +132,10 @@ fn get_group_list_for_user(uid: Uid) -> nix::Result<Vec<Group>> {
         return Ok(vec![]);
     };
 
-    let user_name = CString::new(user.name).expect("Nul in user name");
+    let Ok(user_name) = CString::new(user.name) else {
+        eprintln!("Username had embedded nul character(s), {uid} is not a valid switch target");
+        return Ok(vec![]);
+    };
 
     let mut collected = vec![];
     for gid in getgrouplist(user_name.as_c_str(), user.gid)? {
@@ -147,14 +155,19 @@ fn session_owner_is_in_users_group(uid: Uid) -> bool {
 }
 
 fn main() {
-    let connection = Connection::new_system().unwrap();
+    let connection = Connection::new_system().expect("need D-Bus connection to work");
     let mut on_login =
         MatchRule::new_signal("org.freedesktop.DBus.Properties", "PropertiesChanged");
     on_login.path = Some("/org/freedesktop/login1/seat/seat0".into());
+    on_login.sender = Some("org.freedesktop.login1".into());
 
-    connection.add_match(on_login, do_ownership_switch).unwrap();
+    connection
+        .add_match(on_login, do_ownership_switch)
+        .expect("need to be able to subscribe to seat event");
 
     loop {
-        connection.process(Duration::from_hours(24)).unwrap();
+        connection
+            .process(Duration::from_hours(24))
+            .expect("DBus went away, can't continue");
     }
 }

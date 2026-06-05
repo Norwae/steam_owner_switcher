@@ -1,14 +1,30 @@
+# example unit file for the switcher daemon - adapt as needed for your system
+
 [Unit]
 Requires=systemd-logind.service
 Description=Multi-User Steam Library Ownership Changer
 StartLimitBurst=3
 StartLimitIntervalSec=60
+# if we can't get this started repeatedly, something is wrong in D-Bus and we just accept that this will not work
+# until this is fixed (likely with a reboot)
 
 [Service]
+# servies starts and keeps going
 Type=simple
 ExecStart=/usr/local/sbin/steamlib_owner_switch_daemon
+
+# if it crashes, try again after a moment (hickup in D-Bus?)
 RestartSec=5
 Restart=on-failure
 
+# We don't want to write anywhere but the library path
+ProtectSystem=strict
+ReadWritePaths=/opt/steamlib
+
+# And don't need anything but chown (obvious) and DAC_READ (to ignore permissions in traversal)
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_CHOWN CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target
