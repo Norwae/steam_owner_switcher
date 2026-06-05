@@ -3,10 +3,11 @@ use dbus::blocking::{BlockingSender, Connection};
 use dbus::message::MatchRule;
 use dbus::{Message, Path};
 use nix::unistd::{Group, Uid, User, getgrouplist};
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fs::{read_dir, symlink_metadata};
 use std::os::unix::fs::{MetadataExt, lchown};
-use std::path::PathBuf as FsPathBuf;
+use std::path::PathBuf;
 use std::time::Duration;
 
 fn detect_switch_to_session(msg: &Message) -> Option<Path<'_>> {
@@ -69,7 +70,7 @@ fn do_ownership_switch<'a>(_signal: (), conn: &Connection, msg: &Message) -> boo
 }
 
 fn perform_chown_to_uid(uid: Uid) {
-    let path = FsPathBuf::from("/opt/steamlib/");
+    let path = PathBuf::from("/opt/steamlib/");
     let meta = path.symlink_metadata().unwrap();
     // safe because we just matched the user to be in this group
     let group = Group::from_name("users")
@@ -77,11 +78,12 @@ fn perform_chown_to_uid(uid: Uid) {
         .expect("users group exists")
         .gid;
 
-    recursive_chown(path, meta.dev(), uid.as_raw(), group.as_raw());
+    walk_and_chown(path, meta.dev(), uid.as_raw(), group.as_raw());
 }
 
-fn recursive_chown_fallible(
-    path: &FsPathBuf,
+fn chown_and_queue_children(
+    path: &PathBuf,
+    queue: &mut VecDeque<PathBuf>,
     dev: u64,
     uid: u32,
     gid: u32,
@@ -100,7 +102,7 @@ fn recursive_chown_fallible(
             if path_metadata.is_dir() {
                 for child in read_dir(path)? {
                     let child = child?;
-                    recursive_chown(child.path(), dev, uid, gid);
+                    queue.push_back(child.path());
                 }
             }
         }
@@ -108,9 +110,15 @@ fn recursive_chown_fallible(
     Ok(())
 }
 
-fn recursive_chown(path: FsPathBuf, dev: u64, uid: u32, gid: u32) {
-    if let Some(error) = recursive_chown_fallible(&path, dev, uid, gid).err() {
-        eprintln!("Could not chown and recurse at {path:?}: {error}")
+fn walk_and_chown(path: PathBuf, dev: u64, uid: u32, gid: u32) {
+    let mut queue = VecDeque::new();
+    queue.push_back(path);
+
+    while let Some(path) = queue.pop_front() {
+        let error = chown_and_queue_children(&path, &mut queue, dev, uid, gid).err();
+        if let Some(error) = error {
+            eprintln!("Could not introspect and chown at {path:?}: {error}")
+        }
     }
 }
 
