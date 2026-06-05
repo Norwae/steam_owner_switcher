@@ -1,11 +1,14 @@
 [Unit]
 Requires=systemd-logind.service
 Description=Multi-User Steam Library Ownership Changer
+StartLimitBurst=3
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/steamlib_owner_switch_daemon
 RestartSec=5
+Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
