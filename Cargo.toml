@@ -1,0 +1,9 @@
+[package]
+name = "owner_switcher"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+dbus = "0.9.11"
+nix = { version = "0.31.3", features = ["user", "fs"] }
