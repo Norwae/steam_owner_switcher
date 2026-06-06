@@ -2,10 +2,9 @@ use dbus::arg::{PropMap, RefArg, Variant};
 use dbus::blocking::{BlockingSender, Connection};
 use dbus::message::MatchRule;
 use dbus::{Message, Path};
-use nix::NixPath;
 use nix::dir::Dir;
+use nix::errno::Errno;
 use nix::fcntl::{OFlag, open};
-use nix::libc::DIR;
 use nix::sys::stat::{Mode, SFlag, fstat};
 use nix::unistd::{Gid, Group, Uid, User, fchown, getgrouplist};
 use std::collections::VecDeque;
@@ -70,11 +69,11 @@ fn potentially_change_ownership(conn: &Connection, msg: &Message) -> Option<u64>
 
 fn handle_seat_change<'a>(_signal: (), conn: &Connection, msg: &Message) -> bool {
     match potentially_change_ownership(conn, msg) {
-        None => {
-            println!("No change in ownership necessary")
-        }
         Some(count) => {
             println!("Updated ownership to {count} files");
+        }
+        _ => {
+            // nothing to do
         }
     }
 
@@ -84,9 +83,7 @@ fn handle_seat_change<'a>(_signal: (), conn: &Connection, msg: &Message) -> bool
 fn perform_chown(uid: Uid, gid: Gid) -> u64 {
     let mut count = 0u64;
     let mut queue = VecDeque::new();
-    let start_path = PathBuf::from("/opt/steamlib/")
-        .canonicalize()
-        .expect("canonical form for processed root");
+    let start_path = PathBuf::from("/opt/steamlib/");
     let expected_device = start_path
         .metadata()
         .expect("/opt/steamlib must exist")
@@ -98,6 +95,9 @@ fn perform_chown(uid: Uid, gid: Gid) -> u64 {
         match process_next_file(&path, &mut queue, expected_device, uid, gid) {
             Ok(n) => {
                 count += n;
+            }
+            Err(Errno::EMLINK) | Err(Errno::ELOOP) => {
+                // nothing required, just a symlink we ignore
             }
             Err(errno) => {
                 eprintln!(
@@ -118,6 +118,7 @@ fn process_next_file(
     user: Uid,
     group: Gid,
 ) -> nix::Result<u64> {
+    let mut n = 0;
     let fd = open(path, OFlag::O_RDONLY | OFlag::O_NOFOLLOW, Mode::empty())?;
     // nofollow already removes all symlinks, no explicit check required
     let file_stat = fstat(&fd)?;
@@ -128,12 +129,12 @@ fn process_next_file(
             file_stat.st_dev,
             expected_device
         );
-        Ok(0)
     } else {
         let flags = SFlag::from_bits_truncate(file_stat.st_mode);
 
         if file_stat.st_uid != user.as_raw() || file_stat.st_gid != group.as_raw() {
             fchown(&fd, Some(user), Some(group))?;
+            n = 1;
         }
 
         if flags.contains(SFlag::S_IFDIR) {
@@ -143,24 +144,21 @@ fn process_next_file(
                 let entry = entry?;
                 let mut next_path = path.clone();
                 let name = entry.file_name();
+
+                if c"." == name || c".." == name {
+                    continue;
+                }
+
                 let Ok(name) = name.to_str() else {
                     eprintln!("UTF-8 fuckery on {name:?}, will not proceed");
                     continue;
                 };
                 next_path.push(name);
-                let Ok(next_path) = next_path.canonicalize() else {
-                    eprintln!("Could not form canonical next path {}", next_path.display());
-                    continue;
-                };
-
-                // skip . or ..
-                if next_path.len() > path.len() {
-                    queue.push_back(next_path);
-                }
+                queue.push_back(next_path);
             }
         }
-        Ok(1)
     }
+    Ok(n)
 }
 
 fn get_group_list_for_user(uid: Uid) -> nix::Result<Vec<Group>> {
