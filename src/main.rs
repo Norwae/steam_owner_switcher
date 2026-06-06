@@ -2,11 +2,15 @@ use dbus::arg::{PropMap, RefArg, Variant};
 use dbus::blocking::{BlockingSender, Connection};
 use dbus::message::MatchRule;
 use dbus::{Message, Path};
-use nix::unistd::{Group, Uid, User, getgrouplist};
+use nix::NixPath;
+use nix::dir::Dir;
+use nix::fcntl::{OFlag, open};
+use nix::libc::DIR;
+use nix::sys::stat::{Mode, SFlag, fstat};
+use nix::unistd::{Gid, Group, Uid, User, fchown, getgrouplist};
 use std::collections::VecDeque;
 use std::ffi::CString;
-use std::fs::{read_dir, symlink_metadata};
-use std::os::unix::fs::{MetadataExt, lchown};
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -52,79 +56,111 @@ fn examine_session_for_user(connection: &Connection, session_path: Path) -> Opti
     Some(uid_response.0)
 }
 
-fn do_ownership_switch<'a>(_signal: (), conn: &Connection, msg: &Message) -> bool {
-    let session = detect_switch_to_session(msg);
-    if let Some(session) = session {
-        println!("Seat changed to {session}");
-        if let Some(uid_to_switch) = examine_session_for_user(conn, session) {
-            println!("Session owned by {uid_to_switch}, checking users group");
-            let uid_to_switch = Uid::from_raw(uid_to_switch);
-            if session_owner_is_in_users_group(uid_to_switch) {
-                println!("Switching to {uid_to_switch}");
-                let count = perform_chown_to_uid(uid_to_switch);
-                println!("Switch complete, altered {count} files");
-            }
+fn potentially_change_ownership(conn: &Connection, msg: &Message) -> Option<u64> {
+    let session = detect_switch_to_session(msg)?;
+    println!("Seat changed to {session}");
+    let uid_to_switch = examine_session_for_user(conn, session)?;
+    println!("Session owned by {uid_to_switch}, checking users group");
+    let uid = Uid::from_raw(uid_to_switch);
+    let gid = session_owner_is_in_users_group(uid)?;
+    println!("Switching to {uid}:{gid}");
+    let count = perform_chown(uid, gid);
+    Some(count)
+}
+
+fn handle_seat_change<'a>(_signal: (), conn: &Connection, msg: &Message) -> bool {
+    match potentially_change_ownership(conn, msg) {
+        None => {
+            println!("No change in ownership necessary")
+        }
+        Some(count) => {
+            println!("Updated ownership to {count} files");
         }
     }
+
     true
 }
 
-fn perform_chown_to_uid(uid: Uid) -> u64 {
-    let path = PathBuf::from("/opt/steamlib/");
-    let meta = path.symlink_metadata().unwrap();
-    // safe because we just matched the user to be in this group
-    let group = Group::from_name("users")
-        .expect("group lookup")
-        .expect("users group exists")
-        .gid;
-
-    walk_and_chown(path, meta.dev(), uid.as_raw(), group.as_raw())
-}
-
-fn chown_and_queue_children(
-    path: &PathBuf,
-    queue: &mut VecDeque<PathBuf>,
-    count: &mut u64,
-    dev: u64,
-    uid: u32,
-    gid: u32,
-) -> Result<(), std::io::Error> {
-    let path_metadata = symlink_metadata(path)?;
-    if !path_metadata.is_symlink() {
-        let this_device = path_metadata.dev();
-        if this_device != dev {
-            eprintln!(
-                "Crossing device boundary from {dev} to {this_device}, dubious, we're not doing this"
-            )
-        } else {
-            if path_metadata.uid() != uid || path_metadata.gid() != gid {
-                lchown(path, Some(uid), Some(gid))?;
-                *count += 1;
-            }
-            if path_metadata.is_dir() {
-                for child in read_dir(path)? {
-                    let child = child?;
-                    queue.push_back(child.path());
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn walk_and_chown(path: PathBuf, dev: u64, uid: u32, gid: u32) -> u64 {
+fn perform_chown(uid: Uid, gid: Gid) -> u64 {
+    let mut count = 0u64;
     let mut queue = VecDeque::new();
-    let mut count = 0;
-    queue.push_back(path);
+    let start_path = PathBuf::from("/opt/steamlib/")
+        .canonicalize()
+        .expect("canonical form for processed root");
+    let expected_device = start_path
+        .metadata()
+        .expect("/opt/steamlib must exist")
+        .dev();
+
+    queue.push_back(start_path);
 
     while let Some(path) = queue.pop_front() {
-        let error = chown_and_queue_children(&path, &mut queue, &mut count, dev, uid, gid).err();
-        if let Some(error) = error {
-            eprintln!("Could not introspect and chown at {path:?}: {error}")
+        match process_next_file(&path, &mut queue, expected_device, uid, gid) {
+            Ok(n) => {
+                count += n;
+            }
+            Err(errno) => {
+                eprintln!(
+                    "Could not change ownership of {} to {errno}",
+                    path.display()
+                );
+            }
         }
     }
 
     count
+}
+
+fn process_next_file(
+    path: &PathBuf,
+    queue: &mut VecDeque<PathBuf>,
+    expected_device: u64,
+    user: Uid,
+    group: Gid,
+) -> nix::Result<u64> {
+    let fd = open(path, OFlag::O_RDONLY | OFlag::O_NOFOLLOW, Mode::empty())?;
+    // nofollow already removes all symlinks, no explicit check required
+    let file_stat = fstat(&fd)?;
+    if file_stat.st_dev != expected_device {
+        eprintln!(
+            "File {} device {} not equal to root device ({}). Suspicious, will not proceed",
+            path.display(),
+            file_stat.st_dev,
+            expected_device
+        );
+        Ok(0)
+    } else {
+        let flags = SFlag::from_bits_truncate(file_stat.st_mode);
+
+        if file_stat.st_uid != user.as_raw() || file_stat.st_gid != group.as_raw() {
+            fchown(&fd, Some(user), Some(group))?;
+        }
+
+        if flags.contains(SFlag::S_IFDIR) {
+            let dir = Dir::from_fd(fd)?;
+
+            for entry in dir {
+                let entry = entry?;
+                let mut next_path = path.clone();
+                let name = entry.file_name();
+                let Ok(name) = name.to_str() else {
+                    eprintln!("UTF-8 fuckery on {name:?}, will not proceed");
+                    continue;
+                };
+                next_path.push(name);
+                let Ok(next_path) = next_path.canonicalize() else {
+                    eprintln!("Could not form canonical next path {}", next_path.display());
+                    continue;
+                };
+
+                // skip . or ..
+                if next_path.len() > path.len() {
+                    queue.push_back(next_path);
+                }
+            }
+        }
+        Ok(1)
+    }
 }
 
 fn get_group_list_for_user(uid: Uid) -> nix::Result<Vec<Group>> {
@@ -146,11 +182,11 @@ fn get_group_list_for_user(uid: Uid) -> nix::Result<Vec<Group>> {
 
     Ok(collected)
 }
-fn session_owner_is_in_users_group(uid: Uid) -> bool {
+fn session_owner_is_in_users_group(uid: Uid) -> Option<Gid> {
     if let Ok(list) = get_group_list_for_user(uid) {
-        list.iter().any(|g| g.name == "users")
+        list.iter().find(|g| g.name == "users").map(|g| g.gid)
     } else {
-        false
+        None
     }
 }
 
@@ -162,7 +198,7 @@ fn main() {
     on_login.sender = Some("org.freedesktop.login1".into());
 
     connection
-        .add_match(on_login, do_ownership_switch)
+        .add_match(on_login, handle_seat_change)
         .expect("need to be able to subscribe to seat event");
 
     loop {

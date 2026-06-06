@@ -6,4 +6,4 @@ edition = "2024"
 [dependencies]
 
 dbus = "0.9.11"
-nix = { version = "0.31.3", features = ["user", "fs"] }
+nix = { version = "0.31.3", features = ["user", "fs", "dir"] }
