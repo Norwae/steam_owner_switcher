@@ -82,17 +82,16 @@ fn handle_seat_change<'a>(_signal: (), conn: &Connection, msg: &Message) -> bool
 
 fn perform_chown(uid: Uid, gid: Gid) -> u64 {
     let mut count = 0u64;
-    let mut queue = VecDeque::new();
     let start_path = PathBuf::from("/opt/steamlib/");
     let expected_device = start_path
         .metadata()
         .expect("/opt/steamlib must exist")
         .dev();
 
-    queue.push_back(start_path);
+    let mut stack = vec![start_path];
 
-    while let Some(path) = queue.pop_front() {
-        match process_next_file(&path, &mut queue, expected_device, uid, gid) {
+    while let Some(path) = stack.pop() {
+        match process_next_file(&path, &mut stack, expected_device, uid, gid) {
             Ok(n) => {
                 count += n;
             }
@@ -113,7 +112,7 @@ fn perform_chown(uid: Uid, gid: Gid) -> u64 {
 
 fn process_next_file(
     path: &PathBuf,
-    queue: &mut VecDeque<PathBuf>,
+    queue: &mut Vec<PathBuf>,
     expected_device: u64,
     user: Uid,
     group: Gid,
@@ -154,7 +153,7 @@ fn process_next_file(
                     continue;
                 };
                 next_path.push(name);
-                queue.push_back(next_path);
+                queue.push(next_path);
             }
         }
     }
