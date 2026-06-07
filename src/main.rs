@@ -93,7 +93,7 @@ impl TraversalElement {
             TraversalElement::Root(fd, stat) => Ok((fd, stat)),
             TraversalElement::PendingChildNode(parent, name) => {
                 let fd = openat2(
-                    &parent.as_ref(),
+                    parent,
                     name.as_c_str(),
                     OpenHow::new().flags(OFlag::O_RDONLY).resolve(
                         ResolveFlag::RESOLVE_NO_SYMLINKS
