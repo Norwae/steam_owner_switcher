@@ -17,9 +17,11 @@ ExecStart=/usr/local/sbin/steamlib_owner_switch_daemon
 RestartSec=5
 Restart=on-failure
 
-# We don't want to write anywhere but the library path
+# We don't want to write anywhere but the library path, and not read anywhere sensitive
 ProtectSystem=strict
 ReadWritePaths=/opt/steamlib
+PrivateDevices=yes
+ProtectHome=yes
 
 # And don't need anything but chown (obvious) and DAC_READ (to ignore permissions in traversal)
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_READ_SEARCH
