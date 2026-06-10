@@ -5,7 +5,7 @@ use dbus::{Message, Path};
 use nix::dir::Dir;
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open, openat2};
-use nix::sys::stat::{FileStat, Mode, SFlag, fstat};
+use nix::sys::stat::{Mode, SFlag, fstat};
 use nix::unistd::{Gid, Group, Uid, User, fchown, getgrouplist};
 use std::ffi::CString;
 use std::os::fd::OwnedFd;
@@ -25,7 +25,7 @@ fn detect_switch_to_session(msg: &Message) -> Option<Path<'_>> {
 }
 
 fn examine_session_for_user(connection: &Connection, session_path: Path) -> Option<u32> {
-    let mut call_message = Message::call_with_args(
+    let call_message = Message::call_with_args(
         "org.freedesktop.login1",
         session_path,
         "org.freedesktop.DBus.Properties",
@@ -37,7 +37,7 @@ fn examine_session_for_user(connection: &Connection, session_path: Path) -> Opti
         .ok()?;
     let user_path: Variant<(u32, Path)> = response.get1()?;
 
-    call_message = Message::call_with_args(
+    let call_message = Message::call_with_args(
         "org.freedesktop.login1",
         user_path.0.1,
         "org.freedesktop.DBus.Properties",
@@ -81,32 +81,20 @@ fn handle_seat_change<'a>(_signal: (), conn: &Connection, msg: &Message) -> bool
     true
 }
 
-#[derive(Debug)]
-enum TraversalElement {
-    Root(OwnedFd, FileStat),
-    PendingChildNode(Rc<Dir>, CString),
-}
-
-impl TraversalElement {
-    fn resolve(self) -> nix::Result<(OwnedFd, FileStat)> {
-        match self {
-            TraversalElement::Root(fd, stat) => Ok((fd, stat)),
-            TraversalElement::PendingChildNode(parent, name) => {
-                let fd = openat2(
-                    parent,
-                    name.as_c_str(),
-                    OpenHow::new().flags(OFlag::O_RDONLY).resolve(
-                        ResolveFlag::RESOLVE_NO_SYMLINKS
-                            | ResolveFlag::RESOLVE_NO_XDEV
-                            | ResolveFlag::RESOLVE_BENEATH
-                            | ResolveFlag::RESOLVE_NO_MAGICLINKS,
-                    ),
-                )?;
-                let stat = fstat(&fd)?;
-                Ok((fd, stat))
-            }
+struct ToChown(Rc<Dir>, CString);
+fn enqueue_dir_content(dir_fd: OwnedFd, to: &mut Vec<ToChown>) -> nix::Result<()> {
+    let mut dir = Dir::from_fd(dir_fd)?;
+    let entries = dir.iter().collect::<Vec<_>>();
+    let dir = Rc::new(dir);
+    for entry in entries {
+        let entry = entry?; // if directory walk fails for one entry, we just skip the rest
+        if c"." == entry.file_name() || c".." == entry.file_name() {
+            continue;
         }
+
+        to.push(ToChown(dir.clone(), entry.file_name().to_owned()));
     }
+    Ok(())
 }
 
 fn perform_chown(uid: Uid, gid: Gid) -> Result<u64, Errno> {
@@ -118,8 +106,8 @@ fn perform_chown(uid: Uid, gid: Gid) -> Result<u64, Errno> {
         OFlag::O_RDONLY | OFlag::O_NOFOLLOW,
         Mode::empty(),
     )?;
-    let stat = fstat(&fd)?;
-    let mut stack = vec![TraversalElement::Root(fd, stat)];
+    let mut stack = Vec::new();
+    enqueue_dir_content(fd, &mut stack)?;
 
     while let Some(element) = stack.pop() {
         match process_next_file(element, &mut stack, &mut count, uid, gid) {
@@ -136,13 +124,24 @@ fn perform_chown(uid: Uid, gid: Gid) -> Result<u64, Errno> {
 }
 
 fn process_next_file(
-    next: TraversalElement,
-    queue: &mut Vec<TraversalElement>,
+    next: ToChown,
+    queue: &mut Vec<ToChown>,
     count: &mut u64,
     user: Uid,
     group: Gid,
 ) -> nix::Result<()> {
-    let (fd, file_stat) = next.resolve()?;
+    let ToChown(dir, name) = next;
+    let fd = openat2(
+        dir,
+        name.as_c_str(),
+        OpenHow::new().flags(OFlag::O_RDONLY).resolve(
+            ResolveFlag::RESOLVE_NO_SYMLINKS
+                | ResolveFlag::RESOLVE_NO_XDEV
+                | ResolveFlag::RESOLVE_BENEATH
+                | ResolveFlag::RESOLVE_NO_MAGICLINKS,
+        ),
+    )?;
+    let file_stat = fstat(&fd)?;
 
     if file_stat.st_uid != user.as_raw() || file_stat.st_gid != group.as_raw() {
         fchown(&fd, Some(user), Some(group))?;
@@ -150,21 +149,7 @@ fn process_next_file(
     }
 
     if SFlag::from_bits_truncate(file_stat.st_mode).contains(SFlag::S_IFDIR) {
-        let mut dir = Dir::from_fd(fd)?;
-        let entries = dir.iter().collect::<Vec<_>>();
-        let dir = Rc::new(dir);
-
-        for entry in entries {
-            let entry = entry?; // if directory walk fails for one entry, we just skip the rest
-            if c"." == entry.file_name() || c".." == entry.file_name() {
-                continue;
-            }
-
-            queue.push(TraversalElement::PendingChildNode(
-                dir.clone(),
-                entry.file_name().to_owned(),
-            ));
-        }
+        enqueue_dir_content(fd, queue)?;
     }
 
     Ok(())
