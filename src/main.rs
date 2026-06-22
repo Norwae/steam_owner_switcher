@@ -94,7 +94,7 @@ fn enqueue_dir_content(dir_fd: OwnedFd, to: &mut Vec<ToChown>) -> nix::Result<()
 }
 
 fn perform_chown(root: OwnedFd, uid: Uid, gid: Gid) -> Result<u64, Errno> {
-    let marker_fd = save_open(&root, LIBRARY_MARKER_PATH)?;
+    let marker_fd = safe_open(&root, LIBRARY_MARKER_PATH)?;
     let marker = fstat(&marker_fd)?;
 
     if marker.st_uid == uid.as_raw() && marker.st_gid == gid.as_raw() {
@@ -122,7 +122,7 @@ fn perform_chown(root: OwnedFd, uid: Uid, gid: Gid) -> Result<u64, Errno> {
     Ok(count)
 }
 
-fn save_open<FD: AsFd, P: ?Sized + NixPath>(dir: FD, path: &P) -> nix::Result<OwnedFd> {
+fn safe_open<FD: AsFd, P: ?Sized + NixPath>(dir: FD, path: &P) -> nix::Result<OwnedFd> {
     openat2(
         dir,
         path,
@@ -142,7 +142,7 @@ fn process_next_file(
     group: Gid,
 ) -> nix::Result<()> {
     let ToChown(dir, entry) = next;
-    let fd = save_open(dir, entry.file_name())?;
+    let fd = safe_open(dir, entry.file_name())?;
     fchown(&fd, Some(user), Some(group))?;
     if SFlag::from_bits_truncate(fstat(&fd)?.st_mode).contains(SFlag::S_IFDIR) {
         enqueue_dir_content(fd, queue)?;
@@ -182,7 +182,7 @@ fn sanity_check() -> OwnedFd {
     )
     .expect("Root exists and non-symlink dir");
 
-    save_open(&root_fd, LIBRARY_MARKER_PATH).expect("Library root file present");
+    safe_open(&root_fd, LIBRARY_MARKER_PATH).expect("Library root file present");
 
     root_fd
 }
