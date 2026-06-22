@@ -2,6 +2,7 @@ use dbus::arg::{PropMap, RefArg, Variant};
 use dbus::blocking::{BlockingSender, Connection};
 use dbus::message::MatchRule;
 use dbus::{Message, Path};
+use nix::NixPath;
 use nix::dir::{Dir, Entry};
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open, openat2};
@@ -9,12 +10,11 @@ use nix::sys::stat::{Mode, SFlag, fstat};
 use nix::unistd::{Gid, Group, Uid, User, dup, fchown, getgrouplist};
 use std::env::var;
 use std::ffi::CString;
-use std::fs::exists;
-use std::os::fd::OwnedFd;
-use std::path::PathBuf;
-use std::process::exit;
+use std::os::fd::{AsFd, OwnedFd};
 use std::rc::Rc;
 use std::time::Duration;
+
+const LIBRARY_MARKER_PATH: &str = "libraryfolder.vdf";
 
 fn detect_switch_to_session(msg: &Message) -> Option<Path<'_>> {
     let (_if, dict, _inval) = Message::get3::<&str, PropMap, Vec<&str>>(msg);
@@ -67,6 +67,7 @@ fn potentially_change_ownership(root: OwnedFd, conn: &Connection, msg: &Message)
         .into_iter()
         .find(|g| g.name == "users")?
         .gid;
+
     println!("Switching to {uid}:{gid}");
     perform_chown(root, uid, gid)
         .inspect_err(|err| {
@@ -93,14 +94,23 @@ fn enqueue_dir_content(dir_fd: OwnedFd, to: &mut Vec<ToChown>) -> nix::Result<()
 }
 
 fn perform_chown(root: OwnedFd, uid: Uid, gid: Gid) -> Result<u64, Errno> {
-    let mut count = 0u64;
+    let marker_fd = save_open(&root, LIBRARY_MARKER_PATH)?;
+    let marker = fstat(&marker_fd)?;
 
+    if marker.st_uid == uid.as_raw() && marker.st_gid == gid.as_raw() {
+        println!("Library file belongs to current user, no deep scan.");
+        return Ok(0);
+    }
+    drop(marker_fd);
+
+    let mut count = 0u64;
     let mut stack = Vec::new();
     enqueue_dir_content(root, &mut stack)?;
 
     while let Some(element) = stack.pop() {
-        match process_next_file(element, &mut stack, &mut count, uid, gid) {
-            Ok(_) | Err(Errno::ELOOP) | Err(Errno::ENOENT) | Err(Errno::EXDEV) => {
+        match process_next_file(element, &mut stack, uid, gid) {
+            Ok(_) => count += 1,
+            Err(Errno::ELOOP) | Err(Errno::ENOENT) | Err(Errno::EXDEV) => {
                 // Success(ish) cases - we changed the file, it's gone, or we can't
             }
             Err(e) => {
@@ -112,32 +122,29 @@ fn perform_chown(root: OwnedFd, uid: Uid, gid: Gid) -> Result<u64, Errno> {
     Ok(count)
 }
 
-fn process_next_file(
-    next: ToChown,
-    queue: &mut Vec<ToChown>,
-    count: &mut u64,
-    user: Uid,
-    group: Gid,
-) -> nix::Result<()> {
-    let ToChown(dir, entry) = next;
-    let fd = openat2(
+fn save_open<FD: AsFd, P: ?Sized + NixPath>(dir: FD, path: &P) -> nix::Result<OwnedFd> {
+    openat2(
         dir,
-        entry.file_name(),
+        path,
         OpenHow::new().flags(OFlag::O_RDONLY).resolve(
             ResolveFlag::RESOLVE_NO_SYMLINKS
                 | ResolveFlag::RESOLVE_NO_XDEV
                 | ResolveFlag::RESOLVE_BENEATH
                 | ResolveFlag::RESOLVE_NO_MAGICLINKS,
         ),
-    )?;
-    let file_stat = fstat(&fd)?;
+    )
+}
 
-    if file_stat.st_uid != user.as_raw() || file_stat.st_gid != group.as_raw() {
-        fchown(&fd, Some(user), Some(group))?;
-        *count += 1;
-    }
-
-    if SFlag::from_bits_truncate(file_stat.st_mode).contains(SFlag::S_IFDIR) {
+fn process_next_file(
+    next: ToChown,
+    queue: &mut Vec<ToChown>,
+    user: Uid,
+    group: Gid,
+) -> nix::Result<()> {
+    let ToChown(dir, entry) = next;
+    let fd = save_open(dir, entry.file_name())?;
+    fchown(&fd, Some(user), Some(group))?;
+    if SFlag::from_bits_truncate(fstat(&fd)?.st_mode).contains(SFlag::S_IFDIR) {
         enqueue_dir_content(fd, queue)?;
     }
 
@@ -166,45 +173,18 @@ fn get_group_list_for_user(uid: Uid) -> nix::Result<Vec<Group>> {
 
 fn sanity_check() -> OwnedFd {
     let root = var("STEAM_LIBRARY_ROOT").unwrap_or_else(|_| "/opt/steamlib".to_owned());
-    let mut p = PathBuf::from(&root);
+    let root: &str = &root;
 
-    if !exists(&p).expect("initial sanity check failed") {
-        eprintln!("Root path {} does not exist", root);
-        exit(1);
-    }
-
-    p.push("libraryfolder.vdf");
-    if !exists(&p).expect("initial sanity check failed") {
-        eprintln!(
-            "Not a steam library root folder, {} does not exist",
-            p.display()
-        );
-        exit(2)
-    }
-
-    for exclude in ["etc", "bin", "var", "usr", "home"] {
-        p.pop();
-        p.push(exclude);
-        if exists(&p).expect("initial sanity check failed") {
-            eprintln!(
-                "Found suspicious path {} in supposed steam root",
-                p.display()
-            );
-            exit(3)
-        }
-    }
-
-    p.pop();
-
-    open(
-        &p,
-        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_RDONLY,
+    let root_fd = open(
+        root,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
         Mode::empty(),
     )
-    .unwrap_or_else(|e| {
-        eprintln!("Failed to open supposed steam root: {e}");
-        exit(4)
-    })
+    .expect("Root exists and non-symlink dir");
+
+    save_open(&root_fd, LIBRARY_MARKER_PATH).expect("Library root file present");
+
+    root_fd
 }
 
 fn main() {
