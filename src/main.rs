@@ -2,14 +2,17 @@ use dbus::arg::{PropMap, RefArg, Variant};
 use dbus::blocking::{BlockingSender, Connection};
 use dbus::message::MatchRule;
 use dbus::{Message, Path};
-use nix::dir::Dir;
+use nix::dir::{Dir, Entry};
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open, openat2};
 use nix::sys::stat::{Mode, SFlag, fstat};
-use nix::unistd::{Gid, Group, Uid, User, fchown, getgrouplist};
+use nix::unistd::{Gid, Group, Uid, User, dup, fchown, getgrouplist};
+use std::env::var;
 use std::ffi::CString;
+use std::fs::exists;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
+use std::process::exit;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -53,7 +56,7 @@ fn examine_session_for_user(connection: &Connection, session_path: Path) -> Opti
     Some(uid_response.0)
 }
 
-fn potentially_change_ownership(conn: &Connection, msg: &Message) -> Option<u64> {
+fn potentially_change_ownership(root: OwnedFd, conn: &Connection, msg: &Message) -> Option<u64> {
     let session = detect_switch_to_session(msg)?;
     println!("Seat changed to {session}");
     let uid_to_switch = examine_session_for_user(conn, session)?;
@@ -65,25 +68,17 @@ fn potentially_change_ownership(conn: &Connection, msg: &Message) -> Option<u64>
         .find(|g| g.name == "users")?
         .gid;
     println!("Switching to {uid}:{gid}");
-    perform_chown(uid, gid)
+    perform_chown(root, uid, gid)
         .inspect_err(|err| {
-            eprintln!(
-                "Failed to initiate filesystem walk, /opt/steamlib absent or symlink?: {err}"
-            );
+            eprintln!("Failed to initiate filesystem walk, root path absent or symlink?: {err}");
         })
         .ok()
 }
 
-fn handle_seat_change<'a>(_signal: (), conn: &Connection, msg: &Message) -> bool {
-    potentially_change_ownership(conn, msg)
-        .inspect(|count| println!("Successfully changed {count} file owners"));
-
-    true
-}
-
-struct ToChown(Rc<Dir>, CString);
+struct ToChown(Rc<Dir>, Entry);
 fn enqueue_dir_content(dir_fd: OwnedFd, to: &mut Vec<ToChown>) -> nix::Result<()> {
     let mut dir = Dir::from_fd(dir_fd)?;
+    // using iter ensures the dir fd is correctly rewound
     let entries = dir.iter().collect::<Vec<_>>();
     let dir = Rc::new(dir);
     for entry in entries {
@@ -92,22 +87,16 @@ fn enqueue_dir_content(dir_fd: OwnedFd, to: &mut Vec<ToChown>) -> nix::Result<()
             continue;
         }
 
-        to.push(ToChown(dir.clone(), entry.file_name().to_owned()));
+        to.push(ToChown(dir.clone(), entry));
     }
     Ok(())
 }
 
-fn perform_chown(uid: Uid, gid: Gid) -> Result<u64, Errno> {
+fn perform_chown(root: OwnedFd, uid: Uid, gid: Gid) -> Result<u64, Errno> {
     let mut count = 0u64;
-    let start_path = PathBuf::from("/opt/steamlib/");
 
-    let fd = open(
-        &start_path,
-        OFlag::O_RDONLY | OFlag::O_NOFOLLOW,
-        Mode::empty(),
-    )?;
     let mut stack = Vec::new();
-    enqueue_dir_content(fd, &mut stack)?;
+    enqueue_dir_content(root, &mut stack)?;
 
     while let Some(element) = stack.pop() {
         match process_next_file(element, &mut stack, &mut count, uid, gid) {
@@ -130,10 +119,10 @@ fn process_next_file(
     user: Uid,
     group: Gid,
 ) -> nix::Result<()> {
-    let ToChown(dir, name) = next;
+    let ToChown(dir, entry) = next;
     let fd = openat2(
         dir,
-        name.as_c_str(),
+        entry.file_name(),
         OpenHow::new().flags(OFlag::O_RDONLY).resolve(
             ResolveFlag::RESOLVE_NO_SYMLINKS
                 | ResolveFlag::RESOLVE_NO_XDEV
@@ -175,7 +164,51 @@ fn get_group_list_for_user(uid: Uid) -> nix::Result<Vec<Group>> {
     Ok(collected)
 }
 
+fn sanity_check() -> OwnedFd {
+    let root = var("STEAM_LIBRARY_ROOT").unwrap_or_else(|_| "/opt/steamlib".to_owned());
+    let mut p = PathBuf::from(&root);
+
+    if !exists(&p).expect("initial sanity check failed") {
+        eprintln!("Root path {} does not exist", root);
+        exit(1);
+    }
+
+    p.push("libraryfolder.vdf");
+    if !exists(&p).expect("initial sanity check failed") {
+        eprintln!(
+            "Not a steam library root folder, {} does not exist",
+            p.display()
+        );
+        exit(2)
+    }
+
+    for exclude in ["etc", "bin", "var", "usr", "home"] {
+        p.pop();
+        p.push(exclude);
+        if exists(&p).expect("initial sanity check failed") {
+            eprintln!(
+                "Found suspicious path {} in supposed steam root",
+                p.display()
+            );
+            exit(3)
+        }
+    }
+
+    p.pop();
+
+    open(
+        &p,
+        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_RDONLY,
+        Mode::empty(),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to open supposed steam root: {e}");
+        exit(4)
+    })
+}
+
 fn main() {
+    let root = sanity_check();
     let connection = Connection::new_system().expect("need D-Bus connection to work");
     let mut on_login =
         MatchRule::new_signal("org.freedesktop.DBus.Properties", "PropertiesChanged");
@@ -183,7 +216,15 @@ fn main() {
     on_login.sender = Some("org.freedesktop.login1".into());
 
     connection
-        .add_match(on_login, handle_seat_change)
+        .add_match(on_login, move |_: (), conn: &Connection, msg: &Message| {
+            if let Ok(root_copy) = dup(&root) {
+                potentially_change_ownership(root_copy, conn, msg)
+                    .inspect(|count| println!("Successfully changed {count} file owners"));
+            } else {
+                eprintln!("Could not duplicate root descriptor");
+            }
+            true
+        })
         .expect("need to be able to subscribe to seat event");
 
     loop {
