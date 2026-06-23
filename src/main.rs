@@ -17,11 +17,11 @@ use std::time::Duration;
 const LIBRARY_MARKER_PATH: &str = "libraryfolder.vdf";
 
 fn detect_switch_to_session(msg: &Message) -> Option<Path<'_>> {
-    let (_if, dict, _inval) = Message::get3::<&str, PropMap, Vec<&str>>(msg);
+    let (_, dict) = Message::get2::<&str, PropMap>(msg);
     let dict = dict?;
-    let session_value = dict.get_key_value("ActiveSession")?;
+    let (_, Variant(boxed_value)) = dict.get_key_value("ActiveSession")?;
 
-    let mut iter = session_value.1.0.as_iter()?;
+    let mut iter = boxed_value.as_iter()?;
     iter.next()?; // skip session id
 
     Some(iter.next()?.as_str()?.to_owned().into())
@@ -38,22 +38,9 @@ fn examine_session_for_user(connection: &Connection, session_path: Path) -> Opti
     let response = connection
         .send_with_reply_and_block(call_message, Duration::from_millis(100))
         .ok()?;
-    let user_path: Variant<(u32, Path)> = response.get1()?;
+    let Variant((uid, _)) = response.get1::<Variant<(u32, Path)>>()?;
 
-    let call_message = Message::call_with_args(
-        "org.freedesktop.login1",
-        user_path.0.1,
-        "org.freedesktop.DBus.Properties",
-        "Get",
-        ("org.freedesktop.login1.User", "UID"),
-    );
-    let response = connection
-        .send_with_reply_and_block(call_message, Duration::from_millis(100))
-        .ok()?;
-
-    let uid_response: Variant<u32> = response.get1()?;
-
-    Some(uid_response.0)
+    Some(uid)
 }
 
 fn potentially_change_ownership(root: OwnedFd, conn: &Connection, msg: &Message) -> Option<u64> {
@@ -173,18 +160,17 @@ fn get_group_list_for_user(uid: Uid) -> nix::Result<Vec<Group>> {
 
 fn sanity_check() -> OwnedFd {
     let root = var("STEAM_LIBRARY_ROOT").unwrap_or_else(|_| "/opt/steamlib".to_owned());
-    let root: &str = &root;
 
-    let root_fd = open(
-        root,
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
+    let root = open(
+        root.as_str(),
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
         Mode::empty(),
     )
     .expect("Root exists and non-symlink dir");
 
-    safe_open(&root_fd, LIBRARY_MARKER_PATH).expect("Library root file present");
+    safe_open(&root, LIBRARY_MARKER_PATH).expect("Library root file present");
 
-    root_fd
+    root
 }
 
 fn main() {
