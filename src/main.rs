@@ -1,59 +1,36 @@
-use dbus::arg::{PropMap, RefArg, Variant};
-use dbus::blocking::{BlockingSender, Connection};
-use dbus::message::MatchRule;
-use dbus::{Message, Path};
 use nix::NixPath;
-use nix::dir::{Dir, Entry};
-use nix::errno::Errno;
 use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open, openat2};
 use nix::sys::stat::{Mode, SFlag, fstat};
-use nix::unistd::{Gid, Group, Uid, User, dup, fchown, getgrouplist};
 use std::env::var;
 use std::ffi::CString;
 use std::os::fd::{AsFd, OwnedFd};
 use std::rc::Rc;
-use std::time::Duration;
+use std::sync::Arc;
+use std::thread;
+
+use lazy_static::lazy_static;
+use nix::dir::{Dir, Entry};
+use nix::errno::Errno;
+use nix::unistd::{Gid, Group, Uid, User, dup, fchown, getgrouplist};
+use tokio::runtime::Handle;
+use tokio::sync::Mutex;
+use tokio::task::{block_in_place, spawn_blocking};
+use zbus::Connection;
+use zbus::export::ordered_stream::OrderedStreamExt;
+use zbus::fdo::{PropertiesChangedArgs, PropertiesProxy};
+use zbus::names::InterfaceName;
+use zbus::zvariant::{Structure, Value};
 
 const LIBRARY_MARKER_PATH: &str = "libraryfolder.vdf";
-
-fn detect_switch_to_session(msg: &Message) -> Option<Path<'_>> {
-    let (_, dict) = Message::get2::<&str, PropMap>(msg);
-    let dict = dict?;
-    let (_, Variant(boxed_value)) = dict.get_key_value("ActiveSession")?;
-
-    let mut iter = boxed_value.as_iter()?;
-    iter.next()?; // skip session id
-
-    Some(iter.next()?.as_str()?.to_owned().into())
+lazy_static! {
+    static ref SESSION: InterfaceName<'static> =
+        "org.freedesktop.login1.Session".try_into().unwrap();
+    static ref STEAM_GROUP_NAME: String = var("STEAM_GROUP_NAME").unwrap_or("users".to_string());
 }
 
-fn examine_session_for_user(connection: &Connection, session_path: Path) -> Option<u32> {
-    let call_message = Message::call_with_args(
-        "org.freedesktop.login1",
-        session_path,
-        "org.freedesktop.DBus.Properties",
-        "Get",
-        ("org.freedesktop.login1.Session", "User"),
-    );
-    let response = connection
-        .send_with_reply_and_block(call_message, Duration::from_millis(100))
-        .ok()?;
-    let Variant((uid, _)) = response.get1::<Variant<(u32, Path)>>()?;
-
-    Some(uid)
-}
-
-fn potentially_change_ownership(root: OwnedFd, conn: &Connection, msg: &Message) -> Option<u64> {
-    let session = detect_switch_to_session(msg)?;
-    println!("Seat changed to {session}");
-    let uid_to_switch = examine_session_for_user(conn, session)?;
-    println!("Session owned by {uid_to_switch}, checking users group");
+fn verify_and_perform_change(root: OwnedFd, uid_to_switch: u32) -> Option<u64> {
     let uid = Uid::from_raw(uid_to_switch);
-    let gid = get_group_list_for_user(uid)
-        .ok()?
-        .into_iter()
-        .find(|g| g.name == "users")?
-        .gid;
+    let gid = get_legitimizing_group_from(uid)?;
 
     println!("Switching to {uid}:{gid}");
     perform_chown(root, uid, gid)
@@ -108,7 +85,6 @@ fn perform_chown(root: OwnedFd, uid: Uid, gid: Gid) -> Result<u64, Errno> {
 
     Ok(count)
 }
-
 fn safe_open<FD: AsFd, P: ?Sized + NixPath>(dir: FD, path: &P) -> nix::Result<OwnedFd> {
     openat2(
         dir,
@@ -121,7 +97,6 @@ fn safe_open<FD: AsFd, P: ?Sized + NixPath>(dir: FD, path: &P) -> nix::Result<Ow
         ),
     )
 }
-
 fn process_next_file(
     next: ToChown,
     queue: &mut Vec<ToChown>,
@@ -138,28 +113,28 @@ fn process_next_file(
     Ok(())
 }
 
-fn get_group_list_for_user(uid: Uid) -> nix::Result<Vec<Group>> {
-    let Some(user) = User::from_uid(uid)? else {
-        return Ok(vec![]);
+fn get_legitimizing_group_from(uid: Uid) -> Option<Gid> {
+    let Ok(Some(user)) = User::from_uid(uid) else {
+        return None;
     };
 
     let Ok(user_name) = CString::new(user.name) else {
         eprintln!("Username had embedded nul character(s), {uid} is not a valid switch target");
-        return Ok(vec![]);
+        return None;
     };
 
-    let mut collected = vec![];
-    for gid in getgrouplist(user_name.as_c_str(), user.gid)? {
-        if let Some(group) = Group::from_gid(gid)? {
-            collected.push(group);
+    for gid in getgrouplist(user_name.as_c_str(), user.gid).ok()? {
+        if let Ok(Some(group)) = Group::from_gid(gid) {
+            if STEAM_GROUP_NAME.as_str() == group.name {
+                return Some(gid);
+            }
         }
     }
-
-    Ok(collected)
+    None
 }
-
 fn sanity_check() -> OwnedFd {
     let root = var("STEAM_LIBRARY_ROOT").unwrap_or_else(|_| "/opt/steamlib".to_owned());
+    println!("Validating root directory '{root}'");
 
     let root = open(
         root.as_str(),
@@ -173,29 +148,73 @@ fn sanity_check() -> OwnedFd {
     root
 }
 
-fn main() {
-    let root = sanity_check();
-    let connection = Connection::new_system().expect("need D-Bus connection to work");
-    let mut on_login =
-        MatchRule::new_signal("org.freedesktop.DBus.Properties", "PropertiesChanged");
-    on_login.path = Some("/org/freedesktop/login1/seat/seat0".into());
-    on_login.sender = Some("org.freedesktop.login1".into());
-
-    connection
-        .add_match(on_login, move |_: (), conn: &Connection, msg: &Message| {
-            if let Ok(root_copy) = dup(&root) {
-                potentially_change_ownership(root_copy, conn, msg)
-                    .inspect(|count| println!("Successfully changed {count} file owners"));
-            } else {
-                eprintln!("Could not duplicate root descriptor");
-            }
-            true
-        })
-        .expect("need to be able to subscribe to seat event");
-
-    loop {
-        connection
-            .process(Duration::from_hours(24))
-            .expect("DBus went away, can't continue");
+async fn handle_one_seat_change(
+    connection: &Connection,
+    args: zbus::Result<PropertiesChangedArgs<'_>>,
+) -> zbus::Result<Option<u32>> {
+    let args = args?; // to make argument resolution hit the same error handler
+    if "org.freedesktop.login1.Seat" != args.interface_name.as_str() {
+        return Ok(None);
     }
+
+    let Some(session) = args.changed_properties.get("ActiveSession") else {
+        return Ok(None);
+    };
+
+    let session: &Structure = session.downcast_ref()?;
+    Ok(attempt_resolve_session_owner_uid(connection, session).await)
+}
+
+async fn attempt_resolve_session_owner_uid(
+    connection: &Connection,
+    carrier: &Structure<'_>,
+) -> Option<u32> {
+    if carrier.fields().len() == 2
+        && let Value::ObjectPath(path) = &carrier.fields()[1]
+        && path != "/"
+    {
+        // if anything is fishy or unexpected, we do not hard-error but stop processing
+        let proxy = PropertiesProxy::new(connection, "org.freedesktop.login1", path)
+            .await
+            .ok()?;
+        let response = proxy.get(SESSION.clone(), "User").await.ok()?;
+        let response: &Structure = response.downcast_ref().ok()?;
+        let uid: &u32 = response.fields()[0].downcast_ref().ok()?;
+        Some(*uid)
+    } else {
+        None
+    }
+}
+
+#[tokio::main]
+async fn main() -> zbus::Result<()> {
+    let root = sanity_check();
+    let walk_mutex = Arc::new(Mutex::new(root));
+    let connection = Connection::system().await?;
+    let proxy = PropertiesProxy::new(
+        &connection,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1/seat/seat0",
+    )
+    .await?;
+    let mut stream = proxy.receive_properties_changed().await?;
+    while let Some(seat_change_event) = stream.next().await {
+        match handle_one_seat_change(&connection, seat_change_event.args()).await {
+            Ok(None) => {
+                // irrelevant / malformed change
+            }
+            Ok(Some(uid)) => {
+                let walk_mutex = walk_mutex.clone();
+                spawn_blocking(move || {
+                    let root = Handle::current().block_on(walk_mutex.lock());
+                    let root = dup(root.as_fd()).expect("FD table exhausted");
+                    println!("Seat transferred to {uid}");
+                    verify_and_perform_change(root, uid);
+                });
+            }
+            Err(e) => eprintln!("Error handling event {seat_change_event:?}: {e}"),
+        };
+    }
+
+    Ok(())
 }
