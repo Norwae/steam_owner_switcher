@@ -6,7 +6,6 @@ use std::ffi::CString;
 use std::os::fd::{AsFd, OwnedFd};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::thread;
 
 use lazy_static::lazy_static;
 use nix::dir::{Dir, Entry};
@@ -14,7 +13,7 @@ use nix::errno::Errno;
 use nix::unistd::{Gid, Group, Uid, User, dup, fchown, getgrouplist};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
-use tokio::task::{block_in_place, spawn_blocking};
+use tokio::task::{spawn_blocking};
 use zbus::Connection;
 use zbus::export::ordered_stream::OrderedStreamExt;
 use zbus::fdo::{PropertiesChangedArgs, PropertiesProxy};
@@ -30,7 +29,10 @@ lazy_static! {
 
 fn verify_and_perform_change(root: OwnedFd, uid_to_switch: u32) -> Option<u64> {
     let uid = Uid::from_raw(uid_to_switch);
-    let gid = get_legitimizing_group_from(uid)?;
+    let Some(gid) = get_legitimizing_group_from(uid) else {
+        println!("User {uid} not in the legitimizing group");
+        return None;
+    };
 
     println!("Switching to {uid}:{gid}");
     perform_chown(root, uid, gid)
@@ -186,7 +188,7 @@ async fn attempt_resolve_session_owner_uid(
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> zbus::Result<()> {
     let root = sanity_check();
     let walk_mutex = Arc::new(Mutex::new(root));

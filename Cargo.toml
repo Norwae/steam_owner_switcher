@@ -6,6 +6,6 @@ edition = "2024"
 [dependencies]
 
 lazy_static = "1.5"
-tokio = {  version = "1.52", default-features = false, features = ["rt-multi-thread", "rt", "macros"] }
+tokio = {  version = "1.52", default-features = false, features = [ "rt", "macros"] }
 zbus = { version = "5.16", default-features = false, features = ["tokio"]}
 nix = { version = "0.31", features = ["user", "fs", "dir"] }
