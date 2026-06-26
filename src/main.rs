@@ -211,7 +211,9 @@ async fn main() -> zbus::Result<()> {
                     let root = Handle::current().block_on(walk_mutex.lock());
                     let root = dup(root.as_fd()).expect("FD table exhausted");
                     println!("Seat transferred to {uid}");
-                    verify_and_perform_change(root, uid);
+                    if let Some(count) = verify_and_perform_change(root, uid) {
+                        println!("Updated {count} file ownership markers");
+                    }
                 });
             }
             Err(e) => eprintln!("Error handling event {seat_change_event:?}: {e}"),
