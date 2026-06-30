@@ -13,7 +13,7 @@ use nix::errno::Errno;
 use nix::unistd::{Gid, Group, Uid, User, dup, fchown, getgrouplist};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
-use tokio::task::{spawn_blocking};
+use tokio::task::spawn_blocking;
 use zbus::Connection;
 use zbus::export::ordered_stream::OrderedStreamExt;
 use zbus::fdo::{PropertiesChangedArgs, PropertiesProxy};
@@ -220,5 +220,5 @@ async fn main() -> zbus::Result<()> {
         };
     }
 
-    Ok(())
+    panic!("The seat change stream ended. Crash to get respawned after sanity returns")
 }
