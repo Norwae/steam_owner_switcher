@@ -2,7 +2,7 @@ use nix::NixPath;
 use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open, openat2};
 use nix::sys::stat::{Mode, SFlag, fstat};
 use std::env::var;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::os::fd::{AsFd, OwnedFd};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use zbus::fdo::{PropertiesChangedArgs, PropertiesProxy};
 use zbus::names::InterfaceName;
 use zbus::zvariant::{Structure, Value};
 
-const LIBRARY_MARKER_PATH: &str = "libraryfolder.vdf";
+const LIBRARY_MARKER_PATH: &CStr = c"libraryfolder.vdf";
 lazy_static! {
     static ref SESSION: InterfaceName<'static> =
         "org.freedesktop.login1.Session".try_into().unwrap();
@@ -61,16 +61,24 @@ fn enqueue_dir_content(dir_fd: OwnedFd, to: &mut Vec<ToChown>) -> nix::Result<()
 fn perform_chown(root: OwnedFd, uid: Uid, gid: Gid) -> Result<u64, Errno> {
     let marker_fd = safe_open(&root, LIBRARY_MARKER_PATH)?;
     let marker = fstat(&marker_fd)?;
+    drop(marker_fd);
 
     if marker.st_uid == uid.as_raw() && marker.st_gid == gid.as_raw() {
         println!("Library file belongs to current user, no deep scan.");
         return Ok(0);
     }
-    drop(marker_fd);
 
     let mut count = 0u64;
     let mut stack = Vec::new();
     enqueue_dir_content(root, &mut stack)?;
+    let Some(marker_in_queue) = stack.iter()
+        .position(|ToChown(_, t)|t.file_name() == LIBRARY_MARKER_PATH) else {
+        // marker file went away, wtf?
+        return Err(Errno::ENOENT)
+    };
+    // ensure the marker file is processed last(!) to do a pseudo-commit
+    stack.swap(marker_in_queue, 0);
+
 
     while let Some(element) = stack.pop() {
         match process_next_file(element, &mut stack, uid, gid) {
@@ -86,12 +94,15 @@ fn perform_chown(root: OwnedFd, uid: Uid, gid: Gid) -> Result<u64, Errno> {
 
     Ok(count)
 }
+
 fn safe_open<FD: AsFd, P: ?Sized + NixPath>(dir: FD, path: &P) -> nix::Result<OwnedFd> {
     openat2(
         dir,
         path,
         OpenHow::new()
-            .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOATIME)
+            // O_PATH would be nice to have, but conversion to directory needs a "full" FD
+            // O_NOATIME would also be nice to have, but would require CAP_FOWNER
+            .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC)
             .resolve(
                 ResolveFlag::RESOLVE_NO_SYMLINKS
                     | ResolveFlag::RESOLVE_NO_XDEV
@@ -200,6 +211,8 @@ async fn main() -> zbus::Result<()> {
         "/org/freedesktop/login1/seat/seat0",
     )
     .await?;
+    // we *could* actively query for session-at-startup, but this
+    // is niche on a multiuser system, so not worth additional complexity
     let mut stream = proxy.receive_properties_changed().await?;
     while let Some(seat_change_event) = stream.next().await {
         match handle_one_seat_change(&connection, seat_change_event.args()).await {
@@ -207,13 +220,16 @@ async fn main() -> zbus::Result<()> {
                 // irrelevant / malformed change
             }
             Ok(Some(uid)) => {
-                let root = walk_mutex.clone().lock_owned().await;
+                let walk_guard = walk_mutex.clone().lock_owned().await;
                 spawn_blocking(move || {
-                    let root = dup(root.as_fd()).expect("FD table exhausted");
+                    let walk_root = dup(walk_guard.as_fd()).expect("FD table exhausted");
                     println!("Seat transferred to {uid}");
-                    if let Some(count) = verify_and_perform_change(root, uid) {
+                    if let Some(count) = verify_and_perform_change(walk_root, uid) {
                         println!("Updated {count} file ownership markers");
                     }
+                    // explicit drop to clarify that lifetime __should__ extend to scope to serialize
+                    // the walks. Default, but clippy and some readers might be confused
+                    drop(walk_guard);
                 });
             }
             Err(e) => eprintln!("Error handling event {seat_change_event:?}: {e}"),
