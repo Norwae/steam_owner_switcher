@@ -11,7 +11,6 @@ use lazy_static::lazy_static;
 use nix::dir::{Dir, Entry};
 use nix::errno::Errno;
 use nix::unistd::{Gid, Group, Uid, User, dup, fchown, getgrouplist};
-use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio::task::spawn_blocking;
 use zbus::Connection;
@@ -91,12 +90,14 @@ fn safe_open<FD: AsFd, P: ?Sized + NixPath>(dir: FD, path: &P) -> nix::Result<Ow
     openat2(
         dir,
         path,
-        OpenHow::new().flags(OFlag::O_RDONLY).resolve(
-            ResolveFlag::RESOLVE_NO_SYMLINKS
-                | ResolveFlag::RESOLVE_NO_XDEV
-                | ResolveFlag::RESOLVE_BENEATH
-                | ResolveFlag::RESOLVE_NO_MAGICLINKS,
-        ),
+        OpenHow::new()
+            .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOATIME)
+            .resolve(
+                ResolveFlag::RESOLVE_NO_SYMLINKS
+                    | ResolveFlag::RESOLVE_NO_XDEV
+                    | ResolveFlag::RESOLVE_BENEATH
+                    | ResolveFlag::RESOLVE_NO_MAGICLINKS,
+            ),
     )
 }
 fn process_next_file(
@@ -206,9 +207,8 @@ async fn main() -> zbus::Result<()> {
                 // irrelevant / malformed change
             }
             Ok(Some(uid)) => {
-                let walk_mutex = walk_mutex.clone();
+                let root = walk_mutex.clone().lock_owned().await;
                 spawn_blocking(move || {
-                    let root = Handle::current().block_on(walk_mutex.lock());
                     let root = dup(root.as_fd()).expect("FD table exhausted");
                     println!("Seat transferred to {uid}");
                     if let Some(count) = verify_and_perform_change(root, uid) {
