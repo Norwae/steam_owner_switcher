@@ -5,9 +5,8 @@ use std::env::var;
 use std::ffi::{CStr, CString};
 use std::os::fd::{AsFd, OwnedFd};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use lazy_static::lazy_static;
 use nix::dir::{Dir, Entry};
 use nix::errno::Errno;
 use nix::unistd::{Gid, Group, Uid, User, dup, fchown, getgrouplist};
@@ -20,11 +19,12 @@ use zbus::names::InterfaceName;
 use zbus::zvariant::{Structure, Value};
 
 const LIBRARY_MARKER_PATH: &CStr = c"libraryfolder.vdf";
-lazy_static! {
-    static ref SESSION: InterfaceName<'static> =
-        "org.freedesktop.login1.Session".try_into().unwrap();
-    static ref STEAM_GROUP_NAME: String = var("STEAM_GROUP_NAME").unwrap_or("users".to_string());
-}
+static SESSION: LazyLock<InterfaceName<'static>> =
+    LazyLock::new(|| "org.freedesktop.login1.Session".try_into().unwrap());
+static STEAM_GROUP_NAME: LazyLock<&'static str> = LazyLock::new(|| match var("STEAM_GROUP_NAME") {
+    Ok(st) => st.leak(),
+    Err(_) => "users",
+});
 
 fn verify_and_perform_change(root: OwnedFd, uid_to_switch: u32) -> Option<u64> {
     let uid = Uid::from_raw(uid_to_switch);
@@ -139,7 +139,7 @@ fn get_legitimizing_group_from(uid: Uid) -> Option<Gid> {
 
     for gid in getgrouplist(user_name.as_c_str(), user.gid).ok()? {
         if let Ok(Some(group)) = Group::from_gid(gid) {
-            if STEAM_GROUP_NAME.as_str() == group.name {
+            if *STEAM_GROUP_NAME == group.name {
                 return Some(gid);
             }
         }

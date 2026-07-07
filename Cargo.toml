@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-
-lazy_static = "1.5"
-tokio = {  version = "1.52", default-features = false, features = [ "rt", "macros"] }
-zbus = { version = "5.16", default-features = false, features = ["tokio"]}
+tokio = { version = "1.52", default-features = false, features = ["rt", "macros", "sync"] }
+zbus = { version = "5.16", default-features = false, features = ["tokio"] }
 nix = { version = "0.31", features = ["user", "fs", "dir"] }
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+strip = "symbols"
