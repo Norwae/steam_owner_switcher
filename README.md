@@ -18,4 +18,4 @@ own. That would take fancy VFS/FUSE stuff I don't want to deal with)
 Check a few things:
 * /opt/steamlib exists? If you want it somewhere else, set STEAM_LIBRARY_ROOT in the unit file
 * Is your co-nerd in the users group? Add them. If you want a dedicated group, you can set STEAM_GROUP_NAME in the unit file
-* Does anything crash (`systemctl status`)? If so, give that a good luck and submit a PR.
+* Does anything crash (`systemctl status`)? If so, give that a good look and submit a PR.
